@@ -7,18 +7,23 @@ on:
         description: "Mở SSH (tmate) để vào máy?"
         required: true
         default: "false"
+      allow_overlap:
+        description: "Cho phép chạy song song khi test thủ công? (true = KHÔNG tự hủy lượt trước)"
+        required: true
+        default: "false"
   schedule:
     - cron: "0 */5 * * *"   # restart mỗi 5 giờ
 
-# Gom theo workflow + ref (nhánh). Chạy mới trên CÙNG nhánh sẽ hủy chạy cũ (tránh chồng).
+# Concurrency:
+# - Mặc định (schedule, hoặc dispatch với allow_overlap=false): lượt mới sẽ hủy lượt cũ của cùng nhánh.
+# - Khi dispatch với allow_overlap=true: KHÔNG hủy (dễ test, tránh 'operation was canceled').
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ ! (github.event_name == 'workflow_dispatch' && github.event.inputs.allow_overlap == 'true') }}
 
 jobs:
   vps:
     runs-on: ubuntu-latest
-    # Nên < 300 phút để không đè lịch 5h
     timeout-minutes: 295
 
     env:
@@ -26,57 +31,50 @@ jobs:
       NEXUS_NODE_IDS: "35789137 35928265 35929573"
 
     steps:
+      - name: Print context (debug)
+        run: |
+          echo "event_name=${{ github.event_name }}"
+          echo "ref=${{ github.ref }}"
+          echo "allow_overlap=${{ github.event.inputs.allow_overlap || 'false' }}"
+          echo "cancel_in_progress=$(( ! ( '${{ github.event_name }}' = 'workflow_dispatch' && '${{ github.event.inputs.allow_overlap }}' = 'true' ) ))"
+
       - name: Prep & tools
         run: |
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             tmux curl ca-certificates git protobuf-compiler
-          # Chuẩn bị PATH cho các CLI user-space
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           echo "$HOME/.nexus/bin"  >> "$GITHUB_PATH"
 
       - name: Install Nexus CLI (non-interactive)
         run: |
           set -euxo pipefail
-          # Cài không hỏi (tự yes)
           curl -fsSL https://cli.nexus.xyz/ -o /tmp/nexus_install.sh
           chmod +x /tmp/nexus_install.sh
           yes | /bin/bash /tmp/nexus_install.sh
-
-          # Bổ sung PATH cho step kế tiếp và phiên tmux
           echo "$HOME/.nexus/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.nexus/bin:$PATH"
-
-          # Kiểm tra CLI
           command -v nexus-network
           nexus-network --version || true
 
       - name: Start 3 Nexus nodes in tmux
         run: |
           set -euxo pipefail
+          for s in node1 node2 node3 dash; do tmux kill-session -t "$s" || true; done
+          NX_BIN="$(command -v nexus-network)"; test -x "$NX_BIN"
 
-          # Dọn phiên cũ (an toàn khi rerun)
-          for s in node1 node2 node3 dash; do
-            tmux kill-session -t "$s" || true
-          done
-
-          # Đảm bảo binary tuyệt đối để tránh PATH khác nhau trong tmux
-          NX_BIN="$(command -v nexus-network)"
-          test -x "$NX_BIN"
-
-          # Tạo 3 phiên tmux, mỗi phiên 1 node-id + log riêng
           i=1
           for ID in $NEXUS_NODE_IDS; do
             SESSION="node${i}"
             LOG="/tmp/${SESSION}.log"
-            : > "${LOG}"   # reset log vòng chạy mới
+            : > "${LOG}"
             tmux new-session -d -s "$SESSION" "bash -lc '$NX_BIN start --node-id ${ID} >> ${LOG} 2>&1'"
             echo "Started $SESSION with node-id=$ID (log: $LOG)"
             i=$((i+1))
           done
 
-          # Tạo dashboard 3 ô log
+          # Dashboard 3 ô log
           tmux new-session -d -s dash "bash -lc 'tail -f /tmp/node1.log'"
           tmux split-window -h  "bash -lc 'tail -f /tmp/node2.log'"
           tmux split-window -v  "bash -lc 'tail -f /tmp/node3.log'"
@@ -87,7 +85,6 @@ jobs:
       - name: Auto-attach dashboard on login
         run: |
           set -eux
-          # Tự attach dashboard khi vào tmate
           echo 'if [ -z "$TMUX" ] && tmux has-session -t dash 2>/dev/null; then tmux attach -t dash; fi' >> ~/.bashrc
           echo 'echo "Detach tmux: Ctrl+b rồi nhấn d"' >> ~/.bashrc
 
