@@ -1,0 +1,111 @@
+name: Free Ubuntu VPS with SSH + Nexus (Auto)
+
+on:
+  workflow_dispatch:
+    inputs:
+      enable_ssh:
+        description: "Mở SSH (tmate) để vào máy?"
+        required: true
+        default: "false"
+  schedule:
+    - cron: "0 */5 * * *"   # restart mỗi 5 giờ
+
+concurrency:
+  group: nexus-vps
+  cancel-in-progress: true
+
+jobs:
+  vps:
+    runs-on: ubuntu-latest
+    # nên < 300 phút để tránh chồng lịch 5h
+    timeout-minutes: 299
+
+    env:
+      # Đổi node-id tại đây
+      NEXUS_NODE_IDS: "35789137 35928265 35929573"
+
+    steps:
+      - name: Prep & tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            tmux curl ca-certificates build-essential pkg-config libssl-dev git protobuf-compiler
+          # Thêm các thư mục PATH hay dùng cho CLI cài đặt vào context của Actions
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin"  >> "$GITHUB_PATH"
+          echo "$HOME/.nexus/bin"  >> "$GITHUB_PATH"
+
+      - name: Install Rust (optional, nếu cần dùng cargo)
+        run: |
+          set -euxo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install Nexus CLI (non-interactive)
+        run: |
+          set -euxo pipefail
+          # Tải script về file rồi ép "yes" để tự xác nhận
+          curl -fsSL https://cli.nexus.xyz/ -o /tmp/nexus_install.sh
+          chmod +x /tmp/nexus_install.sh
+          yes | /bin/bash /tmp/nexus_install.sh
+          # Đảm bảo binary nằm trong PATH của step kế tiếp
+          for d in "$HOME/.nexus/bin" "$HOME/.cargo/bin" "$HOME/.local/bin" "/usr/local/bin"; do
+            if [ -x "$d/nexus-network" ]; then
+              echo "$d" >> "$GITHUB_PATH"
+            fi
+          done
+          command -v nexus-network
+
+      - name: Start 3 Nexus nodes in tmux
+        run: |
+          set -euxo pipefail
+          # Dừng các phiên cũ (nếu có) - an toàn khi rerun
+          for s in node1 node2 node3 dash; do
+            tmux kill-session -t "$s" || true
+          done
+
+          # Tạo 3 phiên tmux, mỗi phiên 1 node-id
+          i=1
+          for ID in $NEXUS_NODE_IDS; do
+            SESSION="node${i}"
+            LOG="/tmp/${SESSION}.log"
+            # Xoá log cũ để vòng mới sạch sẽ
+            : > "${LOG}"
+            tmux new-session -d -s "$SESSION" "bash -lc 'nexus-network start --node-id ${ID} >> ${LOG} 2>&1'"
+            echo "Started $SESSION with node-id=$ID (logs: $LOG)"
+            i=$((i+1))
+          done
+
+          tmux ls || true
+
+      - name: Create tmux dashboard (3 panes)
+        run: |
+          set -eux
+          # Dashboard xem 3 log cùng lúc
+          tmux new-session -d -s dash "bash -lc 'tail -f /tmp/node1.log'"
+          tmux split-window -h  "bash -lc 'tail -f /tmp/node2.log'"
+          tmux split-window -v  "bash -lc 'tail -f /tmp/node3.log'"
+          tmux select-layout tiled
+          tmux set -t dash mouse on || true
+
+      - name: Auto-attach dashboard on login
+        run: |
+          set -eux
+          # Tự attach dashboard khi đăng nhập qua tmate
+          echo 'if [ -z "$TMUX" ] && tmux has-session -t dash 2>/dev/null; then tmux attach -t dash; fi' >> ~/.bashrc
+          # Gợi ý lệnh nhanh nếu muốn rời dashboard:
+          echo 'echo "Detach tmux: Ctrl+b rồi nhấn d" ' >> ~/.bashrc
+
+      - name: (Optional) Open SSH (tmate)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.enable_ssh == 'true' }}
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: false
+
+      - name: Keep job alive while nodes run
+        run: |
+          set -euxo pipefail
+          # Giữ job sống bằng cách theo dõi logs (đến khi hết timeout-minutes)
+          touch /tmp/node1.log /tmp/node2.log /tmp/node3.log
+          tail -f /tmp/node1.log /tmp/node2.log /tmp/node3.log
